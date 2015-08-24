@@ -3,7 +3,6 @@ import time
 from utils import sha3
 from collections import Counter
 
-
 def now():
     return int(time.time()*1000)
 
@@ -71,6 +70,14 @@ class SignedMessage(Message):
 
     def __repr__(self):
         return "<%s %r>" % (self.__class__.__name__, self.signature)
+
+    @property
+    def height(self):
+        return self.signature.height
+
+    @property
+    def round(self):
+        return self.signature.round
 
 # syncing
 class BlockRequest(Message):
@@ -146,6 +153,7 @@ class Locked(Vote):
 class LockSet(Hashable):  # careful, is mutable!
 
     eligible_votes = 10
+    processed = False
 
     def __init__(self):
         self.votes = set()

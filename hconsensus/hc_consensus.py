@@ -25,15 +25,25 @@ class ConsensusProtocol(object):
         self.blocks = {head.hash: head}  # hash -> block
 
         # the state
-        self.lock = None
+        self._lock = None
         self.round = 0
         self.height  # is a property, see below
-        self.last_valid_lockset = head.lockset
+
+
+        # locksets
+        self.last_valid_lockset = head.lockset # lockset, that ended the last round
+        # self.lockset          # the lockset for the current round
+        self.last_committing_lockset = head.lockset # lockset, that agreed on a block
+
+        # debug
+        self.messages = []
+
+
 
     # utils
 
     def __repr__(self):
-        return '<CP H:%d R:%d L:%r>' % (self.height, self.round, self.lock)
+        return '<CP H:%d R:%d L:%r>' % (self.height, self.round, self._lock)
 
     def log(self, tag, **kargs):
         c = lambda x: cstr(self.coinbase, x)
@@ -56,26 +66,43 @@ class ConsensusProtocol(object):
         v = abs(hash(repr((height, round))))
         return self.validators[v % len(self.validators)]
 
-    # locks
-    def unlock(self, lockset):
-        self.log('unlocking', lock=self.lock)
-        if self.lock is None:
+    def get_block(self, height):
+        if height > self.head.height:
             return
-        assert lockset.is_valid
-        if lockset.height == self.lock.signature.height:
-            assert lockset.round > self.lock.signature.round
-        self.lock = None
+        blk = self.head
+        while blk.height > height:
+            blk = self.blocks[blk.prevhash]
+        assert blk.height == height
+        return blk
 
-    def relock(self, bh=None):
-        self.log('locking', bh=bh.encode('hex')[:8])
-        assert not self.lock
-        if bh:
-            lock = Locked(self.signature(), bh)
+    # locks
+    def relock(self, lockset=None, blockhash=None):
+        if lockset:
+            # assert the lockset is from the last round
+            assert isinstance(lockset, LockSet)
+            assert lockset.is_valid
+            assert lockset.height == self.height - 1 or lockset.round == self.round - 1
+        else:
+            assert not self._lock
+
+        # unlock
+        if self._lock:
+            # we must not have voted in this round
+            assert self._lock.height < self.height \
+                or lockset.round < self.round
+            self.log('unlocking', lock=self._lock)
+            self._lock = None
+
+        # lock
+        assert not self._lock
+        if blockhash:
+            lock = Locked(self.signature(), blockhash)
         else:
             lock = NotLocked(self.signature())
-        self.lock = lock
+        self._lock = lock
+        self.log('locked')
+        self.env.cancel_timeout()
         return lock
-
 
     # communication
 
@@ -86,6 +113,7 @@ class ConsensusProtocol(object):
 
     def receive_message(self, peer, m):
         self.log('receive', msg=m)
+        self.messages.append(m)
         assert isinstance(m, Message)
         if isinstance(m, Vote):
             self.receive_vote(m)
@@ -104,6 +132,7 @@ class ConsensusProtocol(object):
             self.network.send(peer, BlockReply(b))
 
     def receive_block(self, blk):
+        assert False # broken, needs lockset
         assert blk.lockset.has_quorum_possible
         if blk.height <= self.height:
             return
@@ -112,28 +141,33 @@ class ConsensusProtocol(object):
         else:
             assert blk.prevhash == self.head.hash
             assert isinstance(blk, Block)
-            self.commit(block=blk)
+            self.commit(lockset, block=blk)
 
     # events
 
     def on_timeout(self):
-        # round timed out. i.e. we should not have received a proposal for this round
-        if self.lock and isinstance(self.lock, Locked):
-            assert self.lock.round == 0 or self.lock.round <= self.round
-        lockset = self.lockset.get(self.height, self.round)
-        assert lockset and lockset.is_valid
+        """
+        round timed out.
+        i.e. we have not received a proposal for this round
+        we must not have voted for this round
+        """
 
-        # increment
-        self.new_round()
+        self.log('timeout', expected_from=self.proposer(self.height, self.round))
+        if self._lock:
+            assert self._lock.round < self.round, self._lock
 
-        if self.lock and isinstance(self.lock, Locked):
-            self.lock = Locked(self.signature(), self.lock.blockhash)
+        lockset = self.last_valid_lockset
+        if self._lock and isinstance(self._lock, Locked):
+            self.relock(lockset, self._lock.blockhash)
         else:
-            self.lock = NotLocked(self.signature())
-        self.env.broadcast(self.lock)
+            self.relock(lockset)
+        self.receive_vote(self._lock)  # implicit broadcast
 
     def on_valid_lockset(self, lockset):
         assert lockset.is_valid
+        if lockset.processed:
+            return
+        lockset.processed = True
         self.log('valid lockset', lockset=lockset)
 
         if lockset.height != self.height:
@@ -144,7 +178,7 @@ class ConsensusProtocol(object):
         # commit if possible
         bh = lockset.has_quorum
         if bh:
-            self.commit(bh)
+            self.commit(lockset, bh)
             assert self.round == 0
         else:
             self.new_round(lockset.round + 1)
@@ -156,19 +190,23 @@ class ConsensusProtocol(object):
         self.create_proposal()
 
     def new_height(self):
-        self.lock = None  # None, NotLocked or Locked
+        self._lock = None  # None, NotLocked or Locked
         # self.locksets.cleanup()
         self.round = -1  # will be incremented in new_round
         self.new_round()
 
-    def new_round(self):
-        self.round += 1
+    def new_round(self, round=None):
+        if round is not None:
+            self.round = round
+        else:
+            self.round += 1
         self.log('new round')
+        self.env.cancel_timeout()
         self.env.start_timeout(self.timeout, self.on_timeout)  # implicitly cancels old timeout
         # we might need to propose
         self.create_proposal()
 
-    def commit(self, bh=None, block=None):
+    def commit(self, lockset, bh=None, block=None):
         if block:
             assert isinstance(block, Block)
             bh = block.hash
@@ -184,19 +222,20 @@ class ConsensusProtocol(object):
         assert blk.prevhash == self.head.hash
         assert blk.validate()
         self.head = blk
+        self.last_committing_lockset = lockset
         self.new_height()
 
     def receive_vote(self, v):
         self.log('receive vote', v=v)
         # ignore votes on older heights and rounds
-        H, R = v.signature.height, v.signature.round
+        H, R = v.height, v.round
         if H < self.height:
             return
         if H == self.height and R < self.round:
             return
 
         # broadcast
-        self.log('broadcasting vote')
+        self.log('forwarding vote')
         self.env.broadcast(v)
 
         # add to lockset
@@ -216,7 +255,7 @@ class ConsensusProtocol(object):
         self.on_valid_lockset(self.locksets.get(p.lockset.height, p.lockset.round))
 
         # check if the proposal is on our hight
-        H, R = p.signature.height, p.signature.round
+        H, R = p.height, p.round
         if H < self.height:
             self.log('wrong height')
             return
@@ -224,7 +263,7 @@ class ConsensusProtocol(object):
             self.log('wrong round')
             return
         if H > self.height + 1:
-            self.log('not in sync')
+            self.log('not in sync', lockset=p.lockset, proposal=p, pheight=p.height)
             raise Exception('need to sync')
 
         self.log('proposal is valid')
@@ -239,7 +278,7 @@ class ConsensusProtocol(object):
             if not p.lockset.has_quorum_possible:
                 return  # need no quorum possible to accept VotingInstruction
             self.vote(p)
-        self.log('broadcasting proposal')
+        self.log('forwarding proposal')
         self.env.broadcast(p)
 
     def create_proposal(self):
@@ -248,7 +287,8 @@ class ConsensusProtocol(object):
         and need to include a valid LockSet of the last round
         """
         lockset = self.last_valid_lockset
-        self.log('in create proposal', lockset=lockset)
+        self.log('in create proposal', lockset=lockset,
+                 is_proposer=self.proposer(self.height, self.round))
         assert lockset.is_valid, "can't create proposal w/o valid lockset"
         assert self.height - 1 == lockset.height and self.round == 0 or \
                self.round - 1 == lockset.round and self.height == lockset.height
@@ -258,7 +298,8 @@ class ConsensusProtocol(object):
         self.log('is proposer', H=self.height, R=self.round)
         if self.round == 0 or lockset.has_noquorum:
             # get quorum which signs prev block
-            block = Block(self.coinbase, self.height, self.round, self.head.hash, lockset)
+            cl = self.last_committing_lockset
+            block = Block(self.coinbase, self.height, self.round, self.head.hash, cl)
             proposal = BlockProposal(self.signature(), lockset, block)
         elif lockset.has_quorum_possible:
             bh = lockset.has_quorum_possible
@@ -266,7 +307,7 @@ class ConsensusProtocol(object):
         else:
             raise Exception('invalid lockset')
 
-        self.receive_proposal(proposal)
+        self.receive_proposal(proposal)  # implicit broadcast
 
 
     def vote(self, proposal):
@@ -274,7 +315,7 @@ class ConsensusProtocol(object):
         lockset = proposal.lockset
         self.log('in vote', proposal=proposal)
         assert lockset.is_valid # +2/3 of all votes
-        if proposal.signature.height != self.height or proposal.signature.round != self.round:
+        if proposal.height != self.height or proposal.round != self.round:
             self.log('unexpected', proposal=proposal)
 
         assert self.proposer(self.height, self.round) == proposal.signature.address
@@ -282,21 +323,18 @@ class ConsensusProtocol(object):
         if isinstance(proposal, BlockProposal):
             assert lockset.has_noquorum or lockset.height == self.height - 1
             assert proposal.block.validate()
-            self.unlock(lockset)
             self.blocks[proposal.block.hash] = proposal.block
-            vote = self.relock(proposal.block.hash)
+            vote = self.relock(lockset, blockhash=proposal.block.hash)
         else:
             assert isinstance(proposal, VotingInstruction)
             assert lockset.has_quorum_possible
-            self.unlock(lockset)
-            if isinstance(self.lock, Locked) and self.lock.blockhash == proposal.blockhash:
+            if isinstance(self._lock, Locked) and self._lock.blockhash == proposal.blockhash:
                 # already locked on this block
                 pass
-            self.unlock(lockset)
             if proposal.blockhash not in self.blocks:
                 # don't know this block
-                vote = self.relock()
+                vote = self.relock(lockset)
             else:
-                vote = self.relock(proposal.blockhash)
+                vote = self.relock(lockset, blockhash=proposal.blockhash)
 
-        self.receive_vote(vote)  # use same mechanism
+        self.receive_vote(vote)  # implicit broadcast

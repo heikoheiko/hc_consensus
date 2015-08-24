@@ -14,7 +14,7 @@ UNDERLINE = '\033[4m'
 def DEBUG(*args, **kargs):
     print(FAIL + repr(args) + repr(kargs) + ENDC)
 
-colors = ['\033[9%dm' % i for i in range(8)]
+colors = ['\033[9%dm' % i for i in range(0, 7)]
 colors += ['\033[4%dm' % i for i in range(1, 8)]
 
 def cstr(num, txt):

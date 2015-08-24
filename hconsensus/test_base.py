@@ -1,6 +1,6 @@
 import pytest
-from hc_consensus import Signature, Block, genesis, sha3, ishash
-from hc_consensus import LockSet, Locked, NotLocked, Message, Vote
+from hc_consensus import Signature, Block, mk_genesis, sha3, ishash, BlockProposal
+from hc_consensus import LockSet, Locked, NotLocked, SignedMessage, Vote
 
 eligible_votes = 10
 LockSet.eligible_votes = eligible_votes
@@ -20,39 +20,44 @@ def test_Signature():
 
 
 def test_Block():
-    b1 = Block(1, 2, 3, genesis.hash, LockSet())
-    b2 = Block(1, 2, 3, genesis.hash, LockSet())
+    genesis = mk_genesis(range(10))
+    b1 = Block(1, 2, 3, genesis.hash, genesis.lockset)
+    b2 = Block(1, 2, 3, genesis.hash, genesis.lockset)
     assert b1 == b2
 
 
 def test_Message():
-    m = Message(Signature(1, 2, 3))
+    m = SignedMessage(Signature(1, 2, 3))
+    m2 = SignedMessage(Signature(1, 2, 3))
+    assert m == m2
 
 def test_Vote():
     v = Vote(Signature(1, 2, 3))
-
+    v2 = Vote(Signature(1, 2, 3))
+    assert v == v2
 
 def test_LockSet():
     ls = LockSet()
     assert not ls
     assert len(ls) == 0
-    lsh = ls.hash
-    v1 = Locked(Signature(1, 2, 3), lsh)
-    v2 = Locked(Signature(1, 2, 3), ls.hash)
+    v1 = Locked(Signature(1, 2, 3), '0'*32)
+    v2 = Locked(Signature(1, 2, 3), '0'*32)
     ls.add(v1)
     assert ls
     assert len(ls) == 1
-    assert lsh != ls.hash
     lsh = ls.hash
     ls.add(v1)
     assert lsh == ls.hash
     assert len(ls) == 1
+    ls.add(v2)
+    assert lsh == ls.hash
+    assert len(ls) == 1
+
 
 
 def test_LockSet_isvalid():
     ls = LockSet()
-    bh = ls.hash
-    votes = [Locked(Signature(i, 2, 3), bh) for i in range(ls.eligible_votes)]
+    votes = [Locked(Signature(i, 2, 3), '0'*32) for i in range(ls.eligible_votes)]
     for i, v in enumerate(votes):
         ls.add(v)
         assert len(ls) == i + 1
@@ -108,6 +113,16 @@ def test_LockSet_quorums():
                 else:
                     assert bhs[0][1] > bhs[1][1]
 
-
+def test_BlockProposal():
+    ls = LockSet()
+    for i in range(10):
+        s = Signature(i, 2, 3)
+        ls.add(Locked(s, '0'*32))
+    assert len(ls) == 10
+    assert ls.has_quorum
+    block = Block(1, 2, 3, '0'*32, ls)
+    p = BlockProposal(Signature(1, 2, 3), ls, block)
+    p2 = BlockProposal(Signature(1, 2, 3), ls, block)
+    assert p == p2
 
 

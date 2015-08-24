@@ -1,8 +1,8 @@
 # Copyright (c) 2015 Heiko Hees
 from base import LockSet, LockSetManager, Locked, NotLocked, Message, Vote
 from base import EnvironmentBase, Signature, BlockProposal, VotingInstruction
-from base import BlockRequest, BlockReply, Block, Proposal
-from utils import cstr, DEBUG, isaddress
+from base import BlockRequest, BlockReply, Block, Proposal, isaddress
+from utils import cstr, DEBUG
 
 
 class ConsensusProtocol(object):

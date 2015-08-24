@@ -1,6 +1,6 @@
 import pytest
-from hc_consensus import Signature, Block, mk_genesis, sha3, ishash, BlockProposal
-from hc_consensus import LockSet, Locked, NotLocked, SignedMessage, Vote
+from base import Signature, Block, mk_genesis, sha3, ishash, BlockProposal
+from base import LockSet, Locked, NotLocked, SignedMessage, Vote
 
 eligible_votes = 10
 LockSet.eligible_votes = eligible_votes

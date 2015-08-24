@@ -3,6 +3,7 @@ import simpy
 from base import Message, EnvironmentBase, mk_genesis, LockSet
 from hc_consensus import ConsensusProtocol
 
+
 class Network(object):
 
     def deliver(self, sender, receiver, message):

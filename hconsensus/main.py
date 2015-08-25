@@ -5,6 +5,7 @@ from base import Message, EnvironmentBase, mk_genesis, LockSet
 from utils import DEBUG
 from hc_consensus import ConsensusProtocol
 
+random.seed(42)
 
 class Network(object):
 
@@ -47,7 +48,7 @@ class Transport(object):
         self.egress_filter = set()
         self.ingress_filter = set()
 
-    def broadcast(self, m):
+    def broadcast(self, sender, m):
         assert isinstance(m, Message)
         if self.is_faulty:
             print 'broadcast failed'
@@ -55,15 +56,18 @@ class Transport(object):
             self.egress_filter.add(m.hash)
             self.ingress_filter.add(m.hash)
             for p in self.peers:
-                self.send(p, m)
+                self.send(sender, p, m)
         assert m.hash in self.egress_filter and m.hash in self.ingress_filter
 
-    def sendany(self, m):
+    def sendany(self, sender, m):
         if self.peers:
-            self.network.deliver(self, self.peers[0], m)
+            self.send(sender, self.peers[0], m)
 
-    def send(self, peer, m):
+    def _send(self, sender, peer, m):
+        assert isinstance(sender, ConsensusProtocol), type(sender)
         self.network.deliver(self, peer, m)
+
+    send = _send
 
     def receive(self, peer, m):
         assert isinstance(peer, Transport)
@@ -77,13 +81,23 @@ class Transport(object):
 
     # faultyness
 
-    def wont_send(self, peer, m):
+    def wont_send(self, sender, peer, m):
         pass
+
+    def send_on_timeout_window(self, sender, peer, m):
+        assert isinstance(sender, ConsensusProtocol), type(sender)
+        assert isinstance(sender.timeout, (int, float)), sender.timeout
+
+        def d():
+            yield self.network.env.timeout(sender.timeout)
+            self._send(sender, peer, m)
+            print 'sending late', sender, m
+
+        self.network.env.process(d())
 
     @property
     def is_faulty(self):
-        return self.send == self.wont_send
-
+        return self.send != self._send
 
 
 class SimTimeout(object):
@@ -148,28 +162,48 @@ def add_faulty_nodes(nodes):
         n.env.send = n.env.wont_send
         assert n.env.is_faulty
 
+def add_slow_nodes(nodes):
+    num_faulty = int(len(nodes) * 2/3.)
+    for n in nodes[-num_faulty:]:
+        n.env.send = n.env.send_on_timeout_window
+        assert n.env.is_faulty
+
+
 def check_consistency(nodes):
     print 'checking consistency'
     cs = [n.consensus_protocol for n in nodes]
 
     # check they are all on the same block or the previous one
     s = list(set(c.head.height for c in cs))
-    assert len(s) <= 2
-    assert len(s) == 1 or 1 == abs(s[0] - s[1])
-    best_height = height = max(s)
+    if len(s) > 1:
+        print 'nodes on different heights', s
+        print 'but note: byzantine nodes might have no chance to sync'
+    height = max(s)
 
     # check they are all using the same block
     while height > 0:
         bs = list(set(c.get_block(height) for c in cs))
-        assert len(bs) == 1 or (len(bs) == 2 and None in bs and height == best_height)
+        assert len(bs) == 1 or (len(bs) == 2 and None in bs), bs
         height -= 1
 
     # highest round seen (i.e. number of failed proposers)
     max_rounds = 0
-    blk = cs[0].head
-    while blk.height > 0:
-        max_rounds = max(max_rounds, blk.lockset.round)
-        blk = cs[0].get_block(blk.height-1)
+    for c in cs:
+        blk = c.head
+        while blk.height > 0:
+            max_rounds = max(max_rounds, blk.lockset.round)
+            blk = c.get_block(blk.height-1)
+
+    # messages
+    bytes_transfered = 0
+    num_messages = 0
+    for c in cs:
+        num_messages += len(c.messages)
+        bytes_transfered += sum(m.size for m in c.messages)
+
+    print num_messages, 'messages'
+    print bytes_transfered, 'bytes transfered'
+
 
     print 'max rounds', max_rounds
 
@@ -179,7 +213,7 @@ def main():
 
     # use simpy?
     use_simpy = True
-    sim_duration = 10  # secs
+    sim_duration = 100  # secs
 
     # validators
     num_validators = 10
@@ -204,7 +238,8 @@ def main():
             n.add_peer(nn)
 
     normvariate_base_latencies(nodes)
-    add_faulty_nodes(nodes)
+#    add_faulty_nodes(nodes)
+    add_slow_nodes(nodes)
 
     for n in nodes:
         n.start()

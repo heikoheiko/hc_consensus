@@ -23,6 +23,9 @@ def cstr(num, txt):
 def cprint(num, txt):
     print cstr(num, txt)
 
+def phx(x):
+    return x.encode('hex')[:8]
+
 if __name__ == '__main__':
     for i in range(len(colors)):
         cprint(i, 'test')

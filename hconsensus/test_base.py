@@ -118,11 +118,78 @@ def test_BlockProposal():
     for i in range(10):
         s = Signature(i, 2, 3)
         ls.add(Locked(s, '0'*32))
+
+    bls = LockSet()
+    for i in range(10):
+        s = Signature(i, 1, 2)
+        bls.add(Locked(s, '0'*32))
+
     assert len(ls) == 10
     assert ls.has_quorum
-    block = Block(1, 2, 3, '0'*32, ls)
-    p = BlockProposal(Signature(1, 2, 3), ls, block)
-    p2 = BlockProposal(Signature(1, 2, 3), ls, block)
+    block = Block(1, 2, 4, '0'*32, bls)
+    p = BlockProposal(Signature(1, 2, 4), ls, block)
+    p2 = BlockProposal(Signature(1, 2, 4), ls, block)
     assert p == p2
+
+
+def test_comparisons():
+
+    s11 = Signature(0, 1, 1)
+    s12 = Signature(0, 1, 2)
+    s21 = Signature(0, 2, 1)
+    s22 = Signature(0, 2, 2)
+
+    assert s22.hr > s21.hr > s12.hr > s11.hr
+
+    assert s11.hr == s11.hr
+    assert s12.hr > s11.hr
+    assert s12.hr >= s11.hr
+    assert s21.hr > s11.hr
+    assert s21.hr >= s11.hr
+    assert s21.hr > s12.hr
+    assert not s21.hr <= s12.hr
+    assert s22.hr > s21.hr
+    assert s22.hr == s22.hr
+    assert s22.hr >= s22.hr
+
+    m11 = SignedMessage(s11)
+    m12 = SignedMessage(s12)
+    m21 = SignedMessage(s21)
+    m22 = SignedMessage(s22)
+
+    assert m22.hr > m21.hr > m12.hr > m11.hr
+
+    def mk_ls(h, r):
+        ls = LockSet()
+        votes = [Locked(Signature(i, h, r), '0'*32) for i in range(ls.eligible_votes)]
+        for i, v in enumerate(votes):
+            ls.add(v)
+        return ls
+
+    ls11, ls12, ls21, ls22 = (mk_ls(*s.hr) for s in (s11, s12, s21, s22))
+    assert ls22.hr > ls21.hr > ls12.hr > ls11.hr
+
+    block = Block(1, 2, 2, '0'*32, ls12)
+    assert block
+
+    bp = BlockProposal(s22, ls21, block)
+    bp2 = BlockProposal(s22, ls21, block)
+    assert bp.hash == bp2.hash
+
+    assert bp == bp2
+    assert bp in set([bp2])
+    assert bp.hr == block.hr
+    assert block.hr > ls12.hr
+    assert block.hr == s22.hr
+    assert bp.hr == ls22.hr
+
+    l = Locked(s22, bp.hash)
+    l2 = Locked(s22, bp.hash)
+
+    assert l.hr == l2.hr
+    assert l in set([l2])
+
+
+
 
 

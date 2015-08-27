@@ -25,7 +25,13 @@ class Hashable(object):
         return hash(self) == hash(other)
 
 
-class Signature(Hashable):
+class HeightRoundComparable(object):
+
+    @property
+    def hr(self):
+        return (self.height, self.round)
+
+class Signature(Hashable, HeightRoundComparable):
     "note: this is a dummy signature for quick simulations"
     def __init__(self, address, height, round):
         assert isaddress(address)
@@ -37,7 +43,7 @@ class Signature(Hashable):
         return '<Sig A:%d H:%d R:%d>' % (self.address, self.height, self.round)
 
 
-class Block(Hashable):
+class Block(Hashable, HeightRoundComparable):
 
     def __init__(self, coinbase, height, round, prevhash, lockset):
         assert isaddress(coinbase)
@@ -61,8 +67,7 @@ class Message(Hashable):
     size = 100  # bytes
     pass
 
-
-class SignedMessage(Message):
+class SignedMessage(Message, HeightRoundComparable):
     size = 165
     def __init__(self, signature):
         self.signature = signature
@@ -86,17 +91,18 @@ class BlockRequest(Message):
         self.blockhash = blockhash
 
     def __repr__(self):
-        return "<%s %r>" % (self.__class__.__name__, phx(self.blockhash))
+        return "<%s %r %d>" % (self.__class__.__name__, phx(self.blockhash), id(self))
 
 
 class BlockReply(Message):
     size = 1000
-    def __init__(self, block):  # no sig necessary
+    def __init__(self, block, id):  # no sig necessary
         super(BlockReply, self).__init__()
         self.block = block
+        self.id = id
 
     def __repr__(self):
-        return "<%s %r>" % (self.__class__.__name__, self.block)
+        return "<%s %r %d>" % (self.__class__.__name__, self.block, self.id)
 
 
 # proposals
@@ -104,22 +110,44 @@ class Proposal(SignedMessage):
     def __init__(self, signature, lockset):
         super(Proposal, self).__init__(signature)
         self.lockset = lockset
+        assert self.validate()
+
+    def validate(self):
+        signature = self.signature
+        lockset = self.lockset
+        assert lockset.is_valid
+        assert signature.hr > lockset.hr
+        return True
 
 class BlockProposal(Proposal):
     size = 1000 + 1000
     def __init__(self, signature, lockset, block):
-        super(BlockProposal, self).__init__(signature, lockset)
         self.block = block
+        super(BlockProposal, self).__init__(signature, lockset)
+
 
     def __repr__(self):
         return "<%s %r B:%s>" % (self.__class__.__name__, self.signature, phx(self.block.hash))
 
+    def validate(self):
+        block = self.block
+        signature = self.signature
+        lockset = self.lockset
+        assert block.hr == signature.hr
+        assert signature.round == 0 and lockset.height == block.height - 1 \
+               and lockset.has_quorum \
+               or signature.round == lockset.round + 1
+        assert block.height == signature.height
+        assert block.lockset.height == signature.height - 1  # block must be signed last round
+        return Proposal.validate(self)
 
 class VotingInstruction(Proposal):
     size = 100 + 1000
     def __init__(self, signature, lockset, blockhash):
         super(VotingInstruction, self).__init__(signature, lockset)
         self.blockhash = blockhash
+        assert signature.round == lockset.round + 1
+        assert signature.height == lockset.height
 
     def __repr__(self):
         return "<%s %r B:%s>" % (self.__class__.__name__, self.signature, phx(self.blockhash))
@@ -147,7 +175,7 @@ class Locked(Vote):
         return "<%s %r B:%r>" % (self.__class__.__name__, self.signature, phx(self.blockhash))
 
 
-class LockSet(Hashable):  # careful, is mutable!
+class LockSet(Hashable, HeightRoundComparable):  # careful, is mutable!
 
     eligible_votes = 10
     processed = False
@@ -156,13 +184,23 @@ class LockSet(Hashable):  # careful, is mutable!
         self.votes = set()
 
     def __repr__(self):
-        return '<LockSet(H:%d R:%d V:%d)>' % (self.height, self.round, len(self))
+        if not self.is_valid:
+            s = 'I'
+        elif self.has_quorum:
+            s = 'Q'
+        elif self.has_quorum_possible:
+            s = 'P'
+        elif self.has_noquorum:
+            s = 'N'
+        else:
+            raise Exception('invalid state %r' % self.votes)
+        return '<LockSet(%s, H:%d R:%d V:%d)>' % (s, self.height, self.round, len(self))
 
     def add(self, vote):
         assert isinstance(vote, Vote)
         if vote not in self.votes:
-            assert vote.signature not in [v.signature for v in self.votes]
-            assert not len(self) or self.height_round == (v.signature.height, v.signature.round)
+            assert vote.signature not in [v.signature for v in self.votes], vote
+            assert not len(self) or self.hr == v.hr
             self.votes.add(vote)
             return True
 
@@ -177,18 +215,18 @@ class LockSet(Hashable):  # careful, is mutable!
 
 
     @property
-    def height_round(self):
+    def hr(self):
         assert len(self), 'no votes, can not determin height'
         h = set([(v.signature.height, v.signature.round) for v in self.votes])
         assert len(h) == 1, len(h)
         return list(h)[0]
 
-    height = property(lambda self: self.height_round[0])
-    round = property(lambda self: self.height_round[1])
+    height = property(lambda self: self.hr[0])
+    round = property(lambda self: self.hr[1])
 
     @property
     def is_valid(self):
-        return len(self) > 2/3. * self.eligible_votes and self.height_round
+        return len(self) > 2/3. * self.eligible_votes and self.hr
 
     @property
     def has_quorum(self):
@@ -233,7 +271,7 @@ class LockSetManager(object):
 
     def update(self, lockset):
         for vote in lockset.votes:
-            self.get(vote.signature.height, vote.signature.round).add(vote)
+            self.get(vote.height, vote.round).add(vote)
 
     def cleanup(self, height):
         # cleanup older locksets
@@ -244,7 +282,8 @@ class LockSetManager(object):
     def get(self, height, round):
         return self.locksets.setdefault((height, round), LockSet())
 
-
+    def __iter__(self):
+        return iter(self.locksets.values())
 
 
 def mk_genesis(validators):

@@ -400,16 +400,12 @@ class RoundManager(object):
         p = self.propose()
         if isinstance(p, BlockProposal):
             self.cm.add_block(p.block)
+        if p:
             self.cm.broadcast(p)
         v = self.vote()
         if v:
             self.cm.broadcast(v)
-
-        if self.proposal:
-            assert self.lock
-            if isinstance(self.lock, Locked):
-                assert self.lock.blockhash == self.proposal.blockhash \
-                    or self.proposal.lockset.has_noquorum
+        assert not self.proposal or self.lock
 
     def propose(self):
         proposer = self.cm.proposer(self.height, self.round)

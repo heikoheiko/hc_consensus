@@ -306,11 +306,11 @@ def main(num_nodes=10, sim_duration=10, timeout=0.5,
 
 if __name__ == '__main__':
     num_nodes = 10
-    faulty_fraction = 0
-    slow_fraction = 0
+    faulty_fraction = 1 / 3.  # nodes not sending anything
+    slow_fraction = 1 / 3.    # nodes sending votes and proposals at the edge of the timeout window
 
     nodes = main(num_nodes=num_nodes,
-                 sim_duration=1,
+                 sim_duration=50,
                  timeout=0.5,
                  base_latency=0.05,
                  latency_sigma_factor=0.5,

@@ -3,14 +3,18 @@ import time
 from utils import sha3, phx
 from collections import Counter
 
+
 def now():
-    return int(time.time()*1000)
+    return int(time.time() * 1000)
+
 
 def ishash(h):
     return isinstance(h, str) and len(h) == 32
 
+
 def isaddress(a):
     return isinstance(a, (int, long)) and a >= 0
+
 
 class Hashable(object):
 
@@ -31,8 +35,11 @@ class HeightRoundComparable(object):
     def hr(self):
         return (self.height, self.round)
 
+
 class Signature(Hashable, HeightRoundComparable):
+
     "note: this is a dummy signature for quick simulations"
+
     def __init__(self, address, height, round):
         assert isaddress(address)
         self.address = address
@@ -53,11 +60,11 @@ class Block(Hashable, HeightRoundComparable):
         self.round = round  # only added to differentiate blocks at H
         self.prevhash = prevhash
         assert not len(lockset) or lockset.has_quorum   # genesis
-        self.lockset = lockset
+        self.voteset = self.lockset = lockset.copy()
 
     def __repr__(self):
         return '<Block CB:%s H:%s R:%s prev=%s %r>' % \
-             (self.coinbase, self.height, self.round, phx(self.prevhash), self.lockset)
+            (self.coinbase, self.height, self.round, phx(self.prevhash), self.lockset)
 
     def validate(self):
         return True
@@ -67,8 +74,10 @@ class Message(Hashable):
     size = 100  # bytes
     pass
 
+
 class SignedMessage(Message, HeightRoundComparable):
     size = 165
+
     def __init__(self, signature):
         self.signature = signature
 
@@ -84,18 +93,23 @@ class SignedMessage(Message, HeightRoundComparable):
         return self.signature.round
 
 # syncing
+
+
 class BlockRequest(Message):
     size = 100
+
     def __init__(self, blockhash):  # no sig necessary
         super(BlockRequest, self).__init__()
         self.blockhash = blockhash
 
     def __repr__(self):
+        # add id so they are not filtered
         return "<%s %r %d>" % (self.__class__.__name__, phx(self.blockhash), id(self))
 
 
 class BlockReply(Message):
     size = 1000
+
     def __init__(self, block, id):  # no sig necessary
         super(BlockReply, self).__init__()
         self.block = block
@@ -107,9 +121,12 @@ class BlockReply(Message):
 
 # proposals
 class Proposal(SignedMessage):
+
     def __init__(self, signature, lockset):
+        assert isinstance(signature, Signature)
+        assert isinstance(lockset, LockSet)
         super(Proposal, self).__init__(signature)
-        self.lockset = lockset
+        self.lockset = lockset.copy()
         assert self.validate()
 
     def validate(self):
@@ -119,12 +136,14 @@ class Proposal(SignedMessage):
         assert signature.hr > lockset.hr
         return True
 
+
 class BlockProposal(Proposal):
     size = 1000 + 1000
+
     def __init__(self, signature, lockset, block):
+        assert isinstance(block, Block)
         self.block = block
         super(BlockProposal, self).__init__(signature, lockset)
-
 
     def __repr__(self):
         return "<%s %r B:%s>" % (self.__class__.__name__, self.signature, phx(self.block.hash))
@@ -135,15 +154,22 @@ class BlockProposal(Proposal):
         lockset = self.lockset
         assert block.hr == signature.hr
         assert signature.round == 0 and lockset.height == block.height - 1 \
-               and lockset.has_quorum \
-               or signature.round == lockset.round + 1
+            and lockset.has_quorum \
+            or signature.round == lockset.round + 1
         assert block.height == signature.height
         assert block.lockset.height == signature.height - 1  # block must be signed last round
         return Proposal.validate(self)
 
+    @property
+    def blockhash(self):
+        return self.block.hash
+
+
 class VotingInstruction(Proposal):
     size = 100 + 1000
+
     def __init__(self, signature, lockset, blockhash):
+        assert isinstance(blockhash, bytes)
         super(VotingInstruction, self).__init__(signature, lockset)
         self.blockhash = blockhash
         assert signature.round == lockset.round + 1
@@ -158,14 +184,20 @@ class Vote(SignedMessage):
     size = 100
 
     def __init__(self, signature):
+        assert isinstance(signature, Signature), type(signature)
         super(Vote, self).__init__(signature)
 
+
 class NotLocked(Vote):
+
     "promise to not vote on any block until unlocked"
     pass
 
+
 class Locked(Vote):
+
     "promise to not vote on a different block until unlocked"
+
     def __init__(self, signature, blockhash):
         super(Locked, self).__init__(signature)
         assert ishash(blockhash)
@@ -173,6 +205,10 @@ class Locked(Vote):
 
     def __repr__(self):
         return "<%s %r B:%r>" % (self.__class__.__name__, self.signature, phx(self.blockhash))
+
+
+class DoubleVotingError(Exception):
+    pass
 
 
 class LockSet(Hashable, HeightRoundComparable):  # careful, is mutable!
@@ -183,7 +219,13 @@ class LockSet(Hashable, HeightRoundComparable):  # careful, is mutable!
     def __init__(self):
         self.votes = set()
 
-    def __repr__(self):
+    def copy(self):
+        ls = LockSet()
+        ls.votes = list(self.votes)
+        return ls
+
+    @property
+    def state(self):
         if not self.is_valid:
             s = 'I'
         elif self.has_quorum:
@@ -192,27 +234,36 @@ class LockSet(Hashable, HeightRoundComparable):  # careful, is mutable!
             s = 'P'
         elif self.has_noquorum:
             s = 'N'
-        else:
-            raise Exception('invalid state %r' % self.votes)
-        return '<LockSet(%s, H:%d R:%d V:%d)>' % (s, self.height, self.round, len(self))
+        assert s
+        return '%s:%d' % (s, len(self))
 
-    def add(self, vote):
+    def __repr__(self):
+        return '<LockSet(%s H:%d R:%d)>' % (self.state, self.height, self.round)
+
+    def add(self, vote, force_replace=False):
         assert isinstance(vote, Vote)
         if vote not in self.votes:
-            assert vote.signature not in [v.signature for v in self.votes], vote
-            assert not len(self) or self.hr == v.hr
+            assert not len(self) or self.hr == vote.hr
+            votes = list(self.votes)
+            sigs = [v.signature for v in votes]
+            if vote.signature in sigs:
+                if not force_replace:
+                    raise DoubleVotingError(vote.signature)  # diffent votes on the same H,R
+                self.votes.remove(votes[sigs.index(vote.signature)])
             self.votes.add(vote)
             return True
 
     def __len__(self):
         return len(self.votes)
 
+    def __iter__(self):
+        return iter(self.votes)
+
     def blockhashes(self):
         assert self.is_valid
         c = Counter(v.blockhash for v in self.votes if isinstance(v, Locked))
         # deterministc sort necessary
         return sorted(c.most_common(), cmp=lambda a, b: cmp((b[1], b[0]), (a[1], a[0])))
-
 
     @property
     def hr(self):
@@ -226,7 +277,7 @@ class LockSet(Hashable, HeightRoundComparable):  # careful, is mutable!
 
     @property
     def is_valid(self):
-        return len(self) > 2/3. * self.eligible_votes and self.hr
+        return len(self) > 2 / 3. * self.eligible_votes and self.hr
 
     @property
     def has_quorum(self):
@@ -236,20 +287,18 @@ class LockSet(Hashable, HeightRoundComparable):  # careful, is mutable!
         """
         assert self.is_valid
         bhs = self.blockhashes()
-        if bhs and bhs[0][1] > 2/3. * self.eligible_votes:
+        if bhs and bhs[0][1] > 2 / 3. * self.eligible_votes:
             assert self.has_quorum_possible
             return bhs[0][0]
         assert self.has_noquorum or self.has_quorum_possible
-
 
     @property
     def has_noquorum(self):
         assert self.is_valid
         bhs = self.blockhashes()
-        if not bhs or bhs[0][1] < 1/3. * self.eligible_votes:
+        if not bhs or bhs[0][1] < 1 / 3. * self.eligible_votes:
             assert not self.has_quorum_possible
             return True
-
 
     @property
     def has_quorum_possible(self):
@@ -260,7 +309,7 @@ class LockSet(Hashable, HeightRoundComparable):  # careful, is mutable!
         """
         assert self.is_valid  # we could tell that earlier
         bhs = self.blockhashes()
-        if bhs and bhs[0][1] > 1/3. * self.eligible_votes:
+        if bhs and bhs[0][1] > 1 / 3. * self.eligible_votes:
             return bhs[0][0]
 
 
@@ -288,12 +337,12 @@ class LockSetManager(object):
 
 def mk_genesis(validators):
     ls = LockSet()
-    bh = '\0'*32
+    bh = '\0' * 32
     for a in validators:
         ls.add(Locked(Signature(a, height=0, round=0), bh))
     assert ls.is_valid
     assert bh == ls.has_quorum
-    genesis = Block(2**256-1, 0, 0, bh, ls)
+    genesis = Block(2**256 - 1, 0, 0, bh, ls)
     return genesis
 
 
@@ -313,4 +362,3 @@ class EnvironmentBase(object):
 
     def cancel_timeout(self):
         pass
-

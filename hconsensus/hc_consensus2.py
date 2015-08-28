@@ -1,11 +1,8 @@
 # Copyright (c) 2015 Heiko Hees
 from base import LockSet, LockSetManager, Locked, NotLocked, Message, Vote
-from base import EnvironmentBase, Signature, BlockProposal, VotingInstruction
+from base import DoubleVotingError, Signature, BlockProposal, VotingInstruction
 from base import BlockRequest, BlockReply, Block, Proposal, isaddress
 from utils import cstr, DEBUG, phx
-
-
-##################################################################################
 
 
 class ManagerDict(object):
@@ -39,6 +36,10 @@ class ChainManager(object):
         self.chain = []
         if genesis:
             self.chain.append(genesis)
+
+    @property
+    def genesis(self):
+        return self.chain[0]
 
     @property
     def head(self):
@@ -77,19 +78,24 @@ class Synchronizer(object):
 
     def process(self):
         "check which blocks are missing, request and keep track of them"
+        self.cm.log('in sync.process', known=len(self.cm.block_candidates),
+                    requested=len(self.requested))
         missing = set()
         for blk in self.cm.block_candidates.values():
             if not self.cm.get_block(blk.prevhash):
                 missing.add(blk.prevhash)
-            elif blk.prevhash in self.requested:
-                self.requested.remove(blk.prevhash)  # cleanup
-        p = self.cm.active_round.proposal
-        if isinstance(p, VotingInstruction) and not self.cm.get(p.blockhash):
-            missing.add(p.blockhash)
+            if blk.hash in self.requested:
+                self.requested.remove(blk.hash)  # cleanup
 
+        p = self.cm.active_round.proposal
+        if isinstance(p, VotingInstruction) and not self.cm.get_block(p.blockhash):
+            missing.add(p.blockhash)
         for blockhash in missing - self.requested:
             self.requested.add(blockhash)
             self.cm.broadcast(BlockRequest(blockhash))
+        if self.requested:
+            self.cm.log('sync', requested=[phx(bh) for bh in self.requested],
+                        missing=len(missing))
 
 
 class ConsensusManager(object):
@@ -100,27 +106,33 @@ class ConsensusManager(object):
         self.chainmanager = chainmanager
         self.coinbase = coinbase
         self.validators = validators
+        assert len(self.validators) == LockSet.eligible_votes  # fixme
+        assert self.coinbase in self.validators
+        self.reset()
+
+    def reset(self, to_genesis=False):
+        if to_genesis:
+            self.chainmanager = ChainManager(self.chainmanager.genesis)
+
         self.synchronizer = Synchronizer(self)
         self.heights = ManagerDict(HeightManager, self)
         self.block_candidates = dict()
-
-        assert len(validators) == LockSet.eligible_votes  # fixme
-        assert self.coinbase in self.validators
-
-        # add initial lockset
-        for v in self.head.voteset:
-            self.add_vote(v)
 
         # debug
         self.messages_received = []
         self.messages_sent = []
         self.stopped = False
 
+        # add initial lockset
+        for v in self.head.voteset:
+            self.add_vote(v)
+
     def __repr__(self):
-        return '<CP A:%d H:%d R:%d L:%r>' % (self.coinbase, self.height, self.round, self.lock)
+        return '<CP A:%d H:%d R:%d L:%r %s>' % (self.coinbase, self.height, self.round,
+                                                self.last_lock, self.active_round.lockset.state)
 
     def log(self, tag, **kargs):
-        # if self.coinbase !=0: return
+        # if self.coinbase != 0: return
         t = int(self.env.now)
         c = lambda x: cstr(self.coinbase, x)
         msg = ' '.join([str(t), c(repr(self)),  tag, (' %r' % kargs if kargs else '')])
@@ -147,6 +159,7 @@ class ConsensusManager(object):
     # message handling
 
     def broadcast(self, m):
+        self.log('broadcasting', msg=m)
         self.messages_sent.append(m)
         self.env.broadcast(self, m)
 
@@ -172,21 +185,24 @@ class ConsensusManager(object):
     def receive_block_request(self, peer, blockrequest):
         blockhash = blockrequest.blockhash
         b = self.get_block(blockhash)
-        self.log('receive block request', bh=phx(blockhash), found=b)
         if b:
             self.env.send(self, peer, BlockReply(b, id(blockrequest)))  # filter id
 
     def add_vote(self, v):
         assert isinstance(v, Vote)
         assert v.signature.address in self.validators
-        self.heights[v.height].add_vote(v)
+        # exception for externaly received votes signed by self, necessary for resyncing
+        is_own_vote = bool(v.signature.address == self.coinbase)
+        self.heights[v.height].add_vote(v, force_replace=is_own_vote)
 
     def add_proposal(self, p):
+        self.log('cm.add_proposal', p=p)
         assert p.signature.address in self.validators
         assert p.lockset.is_valid
         assert p.lockset.height == p.height or p.round == 0
         assert p.height == p.signature.height
-        assert p.lockset.round == p.round == p.signature.round
+        assert p.round == p.signature.round
+        assert p.round - p.lockset.round == 1 or p.round == 0
         for v in p.lockset:
             self.add_vote(v)  # implicitly checks their validity
         if isinstance(p, BlockProposal):
@@ -200,21 +216,26 @@ class ConsensusManager(object):
         self.heights[p.height].add_proposal(p)
 
     def add_block(self, blk):
+        if self.get_block(blk.hash):
+            self.log('known block')
+            return
         assert blk.voteset.has_quorum  # on previous block
         assert blk.voteset.height == blk.height - 1
         for v in blk.voteset:
             self.add_vote(v)
         self.block_candidates[blk.hash] = blk
 
+    @property
     def last_committing_lockset(self):
-        return self.heights[self.height - 1].last_valid_lockset()
-
-    def last_valid_lockset(self):
-        return self.heights[self.height].last_valid_lockset() or self.last_committing_lockset()
+        return self.heights[self.height - 1].last_quorum_lockset
 
     @property
-    def lock(self):
-        self.heights[self.height].last_lock()
+    def last_valid_lockset(self):
+        return self.heights[self.height].last_valid_lockset or self.last_committing_lockset
+
+    @property
+    def last_lock(self):
+        return self.heights[self.height].last_lock
 
     @property
     def active_round(self):
@@ -222,35 +243,44 @@ class ConsensusManager(object):
         return hm.rounds[hm.round]
 
     def setup_timeout(self):
+        self.log('in setup_timeout')
         ar = self.active_round
         delay = ar.setup_timeout()
         if delay is not None:
             self.env.start_timeout(delay, self.on_timeout, ar)
+            self.log('set up timeout', now=self.env.now,
+                     delay=delay, triggered=delay + self.env.now)
 
     def on_timeout(self, ar):
+        # self.log('on timeout')
         if self.active_round == ar:
+            self.log('on timeout, matched', ts=self.env.now)
             self.process()
 
     def process(self):
+        self.log('in process')
+        self.commit()
+        self.heights[self.height].process()
         self.commit()
         self.cleanup()
         self.synchronizer.process()
-        self.heights[self.height].process()
         self.setup_timeout()
 
     start = process
 
     def commit(self):
+        self.log('in commit')
         for blk in [c for c in self.block_candidates.values() if c.prevhash == self.head.hash]:
             if self.heights[blk.height].has_quorum == blk.hash:
                 success = self.chainmanager.add_block(blk)
-                self.log('commited', blk=blk)
+                self.log('commited', blk=blk, hash=phx(blk.hash))
                 if success:
                     assert self.head == blk
                     self.commit()
                     return
 
     def cleanup(self):
+        self.log('in cleanup')
         for blk in self.block_candidates.values():
             if self.head.height >= blk.height:
                 self.block_candidates.pop(blk.hash)
@@ -266,23 +296,25 @@ class HeightManager(object):
         self.log = self.cm.log
         self.height = height
         self.rounds = ManagerDict(RoundManager, self)
-        print('Created HeightManager H:%d' % self.height)
+        print('A:%d Created HeightManager H:%d' % (self.cm.coinbase, self.height))
 
     @property
     def round(self):
-        "highest valid lockset on height"
-        for r in reversed(sorted(self.rounds)):
-            if self.rounds[r].lockset.is_valid:
-                return r + 1
+        l = self.last_valid_lockset
+        if l:
+            return l.round + 1
         return 0
 
+    @property
     def last_lock(self):
         "highest lock on height"
         for r in reversed(sorted(self.rounds)):
-            if self.rounds[r].lock:
+            if self.rounds[r].lock is not None:
                 return self.rounds[r].lock
 
+    @property
     def last_valid_lockset(self):
+        "highest valid lockset on height"
         for r in reversed(sorted(self.rounds)):
             ls = self.rounds[r].lockset
             if ls.is_valid:
@@ -290,17 +322,23 @@ class HeightManager(object):
         return None
 
     @property
-    def has_quorum(self):
+    def last_quorum_lockset(self):
         found = None
         for r in sorted(self.rounds):
             ls = self.rounds[r].lockset
             if ls.is_valid and ls.has_quorum:
                 assert found is None  # consistency check, only one quorum allowed
-                found = ls.has_quorum
+                found = ls
         return found
 
-    def add_vote(self, v):
-        self.rounds[v.round].add_vote(v)
+    @property
+    def has_quorum(self):
+        ls = self.last_quorum_lockset
+        if ls:
+            return ls.has_quorum
+
+    def add_vote(self, v, force_replace=False):
+        self.rounds[v.round].add_vote(v, force_replace)
 
     def add_proposal(self, p):
         assert p.height == self.height
@@ -310,6 +348,7 @@ class HeightManager(object):
         self.rounds[p.round].add_proposal(p)
 
     def process(self):
+        self.log('in hm.process', height=self.height)
         self.rounds[self.round].process()
 
 
@@ -329,51 +368,65 @@ class RoundManager(object):
         self.proposal = None
         self.lock = None
         self.timeout_time = None
-        print('Created RoundManager R:%d' % self.round)
+        print('A:%d Created RoundManager H:%d R:%d' %
+              (self.cm.coinbase, self.hm.height, self.round))
 
     def setup_timeout(self):
         "setup a timeout for waiting for a proposal"
-        if self.timeout_time is not None:
+        if self.timeout_time is not None or self.proposal:
             return
         now = self.cm.env.now
         delay = self.timeout * self.timeout_round_factor ** self.round
         self.timeout_time = now + delay
         return delay
 
-    def add_vote(self, v):
-        self.lockset.add(v)
+    def add_vote(self, v, force_replace=False):
+        self.log('rm.adding', vote=v, proposal=self.proposal, pid=id(self.proposal))
+        self.lockset.add(v, force_replace)
 
     def add_proposal(self, p):
+        self.log('rm.adding', proposal=p, old=self.proposal)
         assert not self.proposal
         self.proposal = p
 
     def process(self):
+        self.log('in rm.process', height=self.hm.height, round=self.round)
+
         assert self.cm.round == self.round
         assert self.cm.height == self.hm.height == self.height
-
         if self.cm.stopped:
             self.log('stopped not creating proposal')
             return
         p = self.propose()
-        if p:
+        if isinstance(p, BlockProposal):
+            self.cm.add_block(p.block)
             self.cm.broadcast(p)
         v = self.vote()
         if v:
             self.cm.broadcast(v)
 
+        if self.proposal:
+            assert self.lock
+            if isinstance(self.lock, Locked):
+                assert self.lock.blockhash == self.proposal.blockhash \
+                    or self.proposal.lockset.has_noquorum
+
     def propose(self):
-        if self.cm.proposer(self.height, self.round) != self.cm.coinbase:
+        proposer = self.cm.proposer(self.height, self.round)
+        self.log('in propose', proposer=proposer, proposal=self.proposal, lock=self.lock)
+        if proposer != self.cm.coinbase:
             return
         if self.proposal:
-            assert self.lock and self.lock.blockhash == self.proposal.blockhash
             assert self.proposal.signature.address == self.cm.coinbase
+            assert self.lock
             return
 
-        lockset = self.cm.last_valid_lockset()
+        lockset = self.cm.last_valid_lockset
         self.log('in creating proposal', lockset=lockset)
 
         if self.round == 0 or lockset.has_noquorum:
-            cl = self.cm.last_committing_lockset()  # quorum which signs prev block
+            cl = self.cm.last_committing_lockset  # quorum which signs prev block
+            assert cl.has_quorum
             block = Block(self.cm.coinbase, self.hm.height, self.round, self.cm.head.hash, cl)
             proposal = BlockProposal(self.signature(), lockset, block)
         elif lockset.has_quorum_possible:
@@ -383,37 +436,44 @@ class RoundManager(object):
             raise Exception('invalid lockset')
         self.log('created proposal', p=proposal)
         self.proposal = proposal
+
         return proposal
 
     def vote(self):
         if self.lock:
             return  # voted in this round
-        self.log('in vote', proposal=self.proposal)
+        self.log('in vote', proposal=self.proposal, pid=id(self.proposal))
 
         # get last lock on height
-        last_lock = self.hm.last_lock()
+        last_lock = self.hm.last_lock
 
         if self.proposal:
             if isinstance(self.proposal, VotingInstruction):
                 assert self.proposal.lockset.has_quorum_possible
+                self.log('voting on instruction')
                 v = Locked(self.signature(), self.proposal.blockhash)
             elif not isinstance(last_lock, Locked):
                 assert isinstance(self.proposal, BlockProposal)
                 assert self.proposal.lockset.has_noquorum or self.round == 0
                 assert self.proposal.block.prevhash == self.cm.head.hash
                 assert self.cm.chainmanager.validate_block(self.proposal.block)  # fixme
+                self.log('voting proposed block')
                 v = Locked(self.signature(), self.proposal.block.hash)
             else:  # repeat vote
+                self.log('voting on last vote')
                 v = Locked(self.signature(), last_lock.blockhash)
-        elif self.timeout_time is not None and self.timeout_time < self.cm.env.now:
-            self.log('timeout')
+        elif self.timeout_time is not None and self.cm.env.now >= self.timeout_time:
             if isinstance(last_lock, Locked):  # repeat vote
+                self.log('timeout voting on last vote')
                 v = Locked(self.signature(), last_lock.blockhash)
             else:
+                self.log('timeout voting not locked')
                 v = NotLocked(self.signature())
         else:
             return
+        self.log('voted', vote=v)
         self.lock = v
+        assert self.hm.last_lock == self.lock
         self.lockset.add(v)
         return v
 

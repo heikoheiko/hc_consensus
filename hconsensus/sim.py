@@ -78,7 +78,6 @@ class Transport(object):
     def receive(self, peer, m):
         assert isinstance(peer, Transport)
         assert isinstance(m, Message)
-        # implement delay here
         if m.hash in self.ingress_filter:
             return
         self.ingress_filter.add(m.hash)
@@ -91,11 +90,12 @@ class Transport(object):
         pass
 
     def send_on_timeout_window(self, sender, peer, m):
+        to = sender.active_round.timeout
         assert isinstance(sender, ConsensusManager), type(sender)
-        assert isinstance(sender.timeout, (int, float)), sender.timeout
+        assert isinstance(to, (int, float)), to
 
         def d():
-            yield self.network.env.timeout(sender.timeout)
+            yield self.network.env.timeout(to)
             self._send(sender, peer, m)
             # print 'sending late', sender, m
 
@@ -163,26 +163,24 @@ class Node(object):
         self.consensus_protocol.start()
 
 
-def normvariate_base_latencies(nodes):
-    min_latency = 0.005
+def normvariate_base_latencies(nodes, sigma_factor=0.5):
+    min_latency = 0.001
     for n in nodes:
         t = n.env
-        t.base_latency = max(min_latency, random.normalvariate(t.base_latency, t.base_latency / 2))
+        sigma = t.base_latency * sigma_factor
+        t.base_latency = max(min_latency, random.normalvariate(t.base_latency, sigma))
         assert t.base_latency > 0
 
 
-def add_faulty_nodes(nodes):
-    num_faulty = int(len(nodes) * 1 / 3.)
+def add_faulty_nodes(nodes, num_faulty):
     for n in nodes[:num_faulty]:
         n.env.send = n.env.wont_send
         assert n.env.is_faulty
 
 
-def add_slow_nodes(nodes):
+def add_slow_nodes(nodes, num_slow):
     # nodes sending at the edge of the timeout window
-    # num_slow = int(len(nodes) * 1/3.)
-    num_slow = 1
-    for n in nodes[-num_slow:]:
+    for n in list(reversed(nodes))[:num_slow]:
         n.env.send = n.env.send_on_timeout_window
         assert n.env.is_faulty
 
@@ -233,35 +231,32 @@ def check_consistency(nodes):
     print egress_num_messages, 'egress messages'
     print egress_bytes_transfered, 'bytes sent'
     print egress_bytes_transfered / max_height / len(nodes), 'bytes per height and node'
-    print 'max height', max_height, 'max rounds', max_rounds
+    print 'max height', max_height, 'max rounds', max_rounds + 1
     print
     elapsed = nodes[0].env.network.last_delivery
     print 'elapsed', elapsed
     print 'avg/block time', elapsed / max_height
 
 
-def main():
+def main(num_nodes=10, sim_duration=10, timeout=0.5,
+         base_latency=0.05, latency_sigma_factor=0.5,
+         num_faulty_nodes=3, num_slow_nodes=0):
 
-    # use simpy?
-    use_simpy = True
-    sim_duration = 10  # secs
-
+    sim_duration = sim_duration  # secs
     # initial timeout
-    RoundManager.timeout = 1.
+    RoundManager.timeout = timeout  # secs
+    Transport.base_latency = base_latency  # 0.05 is half the globe one way
 
     # validators
-    num_validators = 3
+    num_validators = num_nodes
     LockSet.eligible_votes = num_validators
 
     validators = range(num_validators)
     genesis = mk_genesis(validators)
     assert genesis.lockset.is_valid
 
-    if use_simpy:
-        env = simpy.Environment()
-        network = SimNetwork(env)
-    else:
-        network = Network()
+    env = simpy.Environment()
+    network = SimNetwork(env)
 
     nodes = []
     for a in validators:
@@ -271,34 +266,54 @@ def main():
         for nn in nodes:
             n.add_peer(nn)
 
-    # normvariate_base_latencies(nodes)
-    # add_faulty_nodes(nodes)
-    # add_slow_nodes(nodes)
+    normvariate_base_latencies(nodes, sigma_factor=latency_sigma_factor)
+    assert num_faulty_nodes + num_slow_nodes <= num_nodes
+    add_faulty_nodes(nodes, num_faulty_nodes)
+    add_slow_nodes(nodes, num_slow_nodes)
 
     for n in nodes:
         n.start()
 
-    if use_simpy:
-        env.run(until=sim_duration)
+    env.run(until=sim_duration)
+
+    if False:
+        print '\n' * 3
+        print int(env.now), 'resetting one node'
+
+        # reset one node and have it sync up
+        n = nodes[0]
+        n.consensus_protocol.reset(to_genesis=True)
+        n.env.send = n.env._send
+        env.run(until=sim_duration * 4)
 
     if False:  # run w/ stopped nodes to check sync
+        print '\n' * 3
         print int(env.now), 'stopping proposals and timeouts'
-        print '\n' * 10
 
         for n in nodes:
             n.consensus_protocol.stopped = True
 
-        # fix faulty (hope they sync up)
+        #  fix faulty(hope they sync up)
         for n in nodes:
             if n.env.send == n.env.wont_send:
                 n.env.send = n.env._send
 
-        if use_simpy:
-            env.run(until=sim_duration * 10)
+        env.run(until=sim_duration * 10)
 
     check_consistency(nodes)
 
     return nodes
 
 if __name__ == '__main__':
-    nodes = main()
+    num_nodes = 10
+    faulty_fraction = 0
+    slow_fraction = 0
+
+    nodes = main(num_nodes=num_nodes,
+                 sim_duration=1,
+                 timeout=0.5,
+                 base_latency=0.05,
+                 latency_sigma_factor=0.5,
+                 num_faulty_nodes=int(num_nodes * faulty_fraction),
+                 num_slow_nodes=int(num_nodes * slow_fraction)
+                 )
